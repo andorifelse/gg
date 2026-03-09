@@ -1,0 +1,11 @@
+*.pyc
+.vscode
+output
+build
+submodules/diff-gaussian-rasterization/diff_gaussian_rasterization.egg-info/
+submodules/simple-knn/simple_knn.egg-info/
+tensorboard_3d
+screenshots
+.idea/
+Tracking-Anything-with-DEVA/saves/
+
