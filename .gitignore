@@ -1,6 +1,7 @@
 *.pyc
 .vscode
 output
+data
 build
 submodules/diff-gaussian-rasterization/diff_gaussian_rasterization.egg-info/
 submodules/simple-knn/simple_knn.egg-info/
