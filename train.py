@@ -21,6 +21,60 @@ from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 import wandb
 import json
+import torch
+import torch.nn.functional as F
+
+def compute_interior_consistency_loss(logits, gt_obj, num_classes, erode_ks=5, min_region=20):
+    """
+    logits: [C, H, W]
+    gt_obj: [H, W]  (long)
+    num_classes: int
+    erode_ks: erosion kernel size, odd number, e.g. 3 or 5
+    min_region: ignore very tiny interior regions
+
+    return:
+        loss_inner: scalar tensor
+    """
+    device = logits.device
+    prob = torch.softmax(logits, dim=0)   # [C, H, W]
+
+    loss_list = []
+
+    pad = erode_ks // 2
+
+    for cls_id in range(num_classes):
+        # 当前类别的二值mask
+        mask = (gt_obj == cls_id).float().unsqueeze(0).unsqueeze(0)   # [1,1,H,W]
+
+        # 如果这个类在当前图里不存在，跳过
+        if mask.sum() < min_region:
+            continue
+
+        # -------------------------
+        # 生成“内部核心区域”
+        # erosion(mask) ≈ min-pooling
+        # min_pool(x) = -max_pool(-x)
+        # -------------------------
+        interior = -F.max_pool2d(-mask, kernel_size=erode_ks, stride=1, padding=pad)
+        interior = (interior > 0.99).squeeze(0).squeeze(0)   # [H,W] bool
+
+        # 过滤太小的内部区域
+        if interior.sum() < min_region:
+            continue
+
+        # 当前类别在内部区域上的预测概率
+        cls_prob = prob[cls_id]   # [H,W]
+
+        # 版本A：鼓励内部区域真实类概率高
+        # loss = mean(1 - p_k(x))
+        inner_loss_cls = (1.0 - cls_prob[interior]).mean()
+
+        loss_list.append(inner_loss_cls)
+
+    if len(loss_list) == 0:
+        return torch.tensor(0.0, device=device)
+
+    return torch.stack(loss_list).mean()
 
 def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoint_iterations, checkpoint, debug_from, use_wandb):
     first_iter = 0
@@ -83,11 +137,48 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         render_pkg = render(viewpoint_cam, gaussians, pipe, background)
         image, viewspace_point_tensor, visibility_filter, radii, objects = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["radii"], render_pkg["render_object"]
 
-        # Object Loss
-        gt_obj = viewpoint_cam.objects.cuda().long()
-        logits = classifier(objects)
-        loss_obj = cls_criterion(logits.unsqueeze(0), gt_obj.unsqueeze(0)).squeeze().mean()
-        loss_obj = loss_obj / torch.log(torch.tensor(num_classes))  # normalize to (0,1)
+        # 2D Object Loss
+        # GT
+        gt_obj = viewpoint_cam.objects.cuda().long()   # [H, W]
+        # prediction
+        logits = classifier(objects)                   # [C, H, W]
+        # pixel-wise CE loss
+        loss_map = cls_criterion(logits.unsqueeze(0), gt_obj.unsqueeze(0)).squeeze(0)  # [H, W]
+
+        # boundary weight
+        weight_map = torch.ones_like(loss_map)
+
+        for cls_id in range(num_classes):
+            mask = (gt_obj == cls_id).float().unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
+
+            if mask.sum() == 0:
+                continue
+
+            dilated = F.max_pool2d(mask, kernel_size=5, stride=1, padding=2)
+            eroded = -F.max_pool2d(-mask, kernel_size=5, stride=1, padding=2)
+            boundary = (dilated != eroded).squeeze(0).squeeze(0)  # [H,W]
+
+            weight_map[boundary] = torch.minimum(
+                weight_map[boundary],
+                torch.tensor(0.3, device=weight_map.device)
+            )
+
+        loss_obj_weight = (loss_map * weight_map).sum() / (weight_map.sum() + 1e-6)
+        # normalize
+        loss_obj_weight = loss_obj_weight / torch.log(torch.tensor(float(num_classes), device=logits.device))
+
+        # interior consistency
+        loss_inner = compute_interior_consistency_loss(
+            logits=logits,
+            gt_obj=gt_obj,
+            num_classes=num_classes,
+            erode_ks=5,
+            min_region=20
+        )
+
+        # total 2d loss
+        lambda_inner = 0.1
+        loss_obj_2d = loss_obj_weight + lambda_inner * loss_inner
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
@@ -99,9 +190,9 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             logits3d = classifier(gaussians._objects_dc.permute(2,0,1))
             prob_obj3d = torch.softmax(logits3d,dim=0).squeeze().permute(1,0)
             loss_obj_3d = loss_cls_3d(gaussians._xyz.squeeze().detach(), prob_obj3d, opt.reg3d_k, opt.reg3d_lambda_val, opt.reg3d_max_points, opt.reg3d_sample_size)
-            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image)) + loss_obj + loss_obj_3d
+            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image)) + loss_obj_2d + loss_obj_3d
         else:
-            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image)) + loss_obj
+            loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * (1.0 - ssim(image, gt_image)) + loss_obj_2d
 
         loss.backward()
         iter_end.record()
