@@ -21,8 +21,12 @@ from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 import wandb
 import json
-import torch
 import torch.nn.functional as F
+import math
+
+ft_start_iter = 20000
+inner_start_iter = 25000
+lambda_inner = 0.1
 
 def compute_interior_consistency_loss(logits, gt_obj, num_classes, erode_ks=5, min_region=20):
     """
@@ -42,7 +46,8 @@ def compute_interior_consistency_loss(logits, gt_obj, num_classes, erode_ks=5, m
 
     pad = erode_ks // 2
 
-    for cls_id in range(num_classes):
+    present_classes = torch.unique(gt_obj)
+    for cls_id in present_classes.tolist():
         # 当前类别的二值mask
         mask = (gt_obj == cls_id).float().unsqueeze(0).unsqueeze(0)   # [1,1,H,W]
 
@@ -142,43 +147,47 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         gt_obj = viewpoint_cam.objects.cuda().long()   # [H, W]
         # prediction
         logits = classifier(objects)                   # [C, H, W]
+        # base CE
         # pixel-wise CE loss
         loss_map = cls_criterion(logits.unsqueeze(0), gt_obj.unsqueeze(0)).squeeze(0)  # [H, W]
+        loss_obj_base = loss_map.mean() / math.log(num_classes)
 
-        # boundary weight
-        weight_map = torch.ones_like(loss_map)
+        if iteration < ft_start_iter:
+            loss_obj_2d = loss_obj_base
+        else:
+            # ---------------- boundary-weighted CE ----------------
+            weight_map = torch.ones_like(loss_map)
 
-        for cls_id in range(num_classes):
-            mask = (gt_obj == cls_id).float().unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
+            present_classes = torch.unique(gt_obj)
+            for cls_id in present_classes.tolist():
+                mask = (gt_obj == cls_id).float().unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
+                if mask.sum() == 0:
+                    continue
 
-            if mask.sum() == 0:
-                continue
+                dilated = F.max_pool2d(mask, kernel_size=5, stride=1, padding=2)
+                eroded = -F.max_pool2d(-mask, kernel_size=5, stride=1, padding=2)
+                boundary = (dilated != eroded).squeeze(0).squeeze(0)
 
-            dilated = F.max_pool2d(mask, kernel_size=5, stride=1, padding=2)
-            eroded = -F.max_pool2d(-mask, kernel_size=5, stride=1, padding=2)
-            boundary = (dilated != eroded).squeeze(0).squeeze(0)  # [H,W]
+                weight_map[boundary] = 0.3
 
-            weight_map[boundary] = torch.minimum(
-                weight_map[boundary],
-                torch.tensor(0.3, device=weight_map.device)
-            )
+            loss_obj_weight = (loss_map * weight_map).sum() / (weight_map.sum() + 1e-6)
+            loss_obj_weight = loss_obj_weight / math.log(num_classes)
 
-        loss_obj_weight = (loss_map * weight_map).sum() / (weight_map.sum() + 1e-6)
-        # normalize
-        loss_obj_weight = loss_obj_weight / torch.log(torch.tensor(float(num_classes), device=logits.device))
+            if iteration < inner_start_iter:
+                loss_obj_2d = loss_obj_weight
+            else:
+                if iteration % 5 == 0:
+                    loss_inner = compute_interior_consistency_loss(
+                        logits=logits,
+                        gt_obj=gt_obj,
+                        num_classes=num_classes,
+                        erode_ks=5,
+                        min_region=20
+                    )
+                else:
+                    loss_inner = torch.tensor(0.0, device=logits.device)
 
-        # interior consistency
-        loss_inner = compute_interior_consistency_loss(
-            logits=logits,
-            gt_obj=gt_obj,
-            num_classes=num_classes,
-            erode_ks=5,
-            min_region=20
-        )
-
-        # total 2d loss
-        lambda_inner = 0.1
-        loss_obj_2d = loss_obj_weight + lambda_inner * loss_inner
+                loss_obj_2d = loss_obj_weight + lambda_inner * loss_inner
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
@@ -206,12 +215,15 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration == opt.iterations:
                 progress_bar.close()
 
-            # Log and save
-            training_report(iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), loss_obj_3d, use_wandb)
-            if (iteration in saving_iterations):
-                print("\n[ITER {}] Saving Gaussians".format(iteration))
-                scene.save(iteration)
-                torch.save(classifier.state_dict(), os.path.join(scene.model_path, "point_cloud/iteration_{}".format(iteration),'classifier.pth'))
+                # Log and save
+                training_report(iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations,
+                                scene, render, (pipe, background), loss_obj_3d, use_wandb)
+                if (iteration in saving_iterations):
+                    print("\n[ITER {}] Saving Gaussians".format(iteration))
+                    scene.save(iteration)
+                    torch.save(classifier.state_dict(),
+                               os.path.join(scene.model_path, "point_cloud/iteration_{}".format(iteration),
+                                            'classifier.pth'))
 
             # Densification
             if iteration < opt.densify_until_iter:
@@ -252,19 +264,23 @@ def prepare_output_and_logger(args):
         cfg_log_f.write(str(Namespace(**vars(args))))
 
 
-def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene : Scene, renderFunc, renderArgs, loss_obj_3d, use_wandb):
-
+def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene: Scene, renderFunc, renderArgs,
+                    loss_obj_3d, use_wandb):
     if use_wandb:
         if loss_obj_3d:
-            wandb.log({"train_loss_patches/l1_loss": Ll1.item(), "train_loss_patches/total_loss": loss.item(), "train_loss_patches/loss_obj_3d": loss_obj_3d.item(), "iter_time": elapsed, "iter": iteration})
+            wandb.log({"train_loss_patches/l1_loss": Ll1.item(), "train_loss_patches/total_loss": loss.item(),
+                       "train_loss_patches/loss_obj_3d": loss_obj_3d.item(), "iter_time": elapsed, "iter": iteration})
         else:
-            wandb.log({"train_loss_patches/l1_loss": Ll1.item(), "train_loss_patches/total_loss": loss.item(), "iter_time": elapsed, "iter": iteration})
-    
+            wandb.log({"train_loss_patches/l1_loss": Ll1.item(), "train_loss_patches/total_loss": loss.item(),
+                       "iter_time": elapsed, "iter": iteration})
+
     # Report test and samples of training set
     if iteration in testing_iterations:
         torch.cuda.empty_cache()
-        validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
-                              {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
+        validation_configs = ({'name': 'test', 'cameras': scene.getTestCameras()},
+                              {'name': 'train',
+                               'cameras': [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in
+                                           range(5, 30, 5)]})
 
         for config in validation_configs:
             if config['cameras'] and len(config['cameras']) > 0:
@@ -275,19 +291,24 @@ def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, 
                     gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
                     if use_wandb:
                         if idx < 5:
-                            wandb.log({config['name'] + "_view_{}/render".format(viewpoint.image_name): [wandb.Image(image)]})
+                            wandb.log(
+                                {config['name'] + "_view_{}/render".format(viewpoint.image_name): [wandb.Image(image)]})
                             if iteration == testing_iterations[0]:
-                                wandb.log({config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name): [wandb.Image(gt_image)]})
+                                wandb.log({config['name'] + "_view_{}/ground_truth".format(viewpoint.image_name): [
+                                    wandb.Image(gt_image)]})
                     l1_test += l1_loss(image, gt_image).mean().double()
                     psnr_test += psnr(image, gt_image).mean().double()
                 psnr_test /= len(config['cameras'])
-                l1_test /= len(config['cameras'])          
+                l1_test /= len(config['cameras'])
                 print("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
                 if use_wandb:
-                    wandb.log({config['name'] + "/loss_viewpoint - l1_loss": l1_test, config['name'] + "/loss_viewpoint - psnr": psnr_test})
+                    wandb.log({config['name'] + "/loss_viewpoint - l1_loss": l1_test,
+                               config['name'] + "/loss_viewpoint - psnr": psnr_test})
         if use_wandb:
-            wandb.log({"scene/opacity_histogram": scene.gaussians.get_opacity, "total_points": scene.gaussians.get_xyz.shape[0], "iter": iteration})
+            wandb.log({"scene/opacity_histogram": scene.gaussians.get_opacity,
+                       "total_points": scene.gaussians.get_xyz.shape[0], "iter": iteration})
         torch.cuda.empty_cache()
+
 
 if __name__ == "__main__":
     # Set up command line argument parser
@@ -303,7 +324,7 @@ if __name__ == "__main__":
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[1_000, 7_000, 30_000, 60_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
-    parser.add_argument("--start_checkpoint", type=str, default = None)
+    parser.add_argument("--start_checkpoint", type=str, default=None)
     # Add an argument for the configuration file
     parser.add_argument("--config_file", type=str, default="config.json", help="Path to the configuration file")
     parser.add_argument("--use_wandb", action='store_true', default=False, help="Use wandb to record loss value")
@@ -329,7 +350,7 @@ if __name__ == "__main__":
     args.reg3d_lambda_val = config.get("reg3d_lambda_val", 2)
     args.reg3d_max_points = config.get("reg3d_max_points", 300000)
     args.reg3d_sample_size = config.get("reg3d_sample_size", 1000)
-    
+
     print("Optimizing " + args.model_path)
 
     if args.use_wandb:
@@ -343,7 +364,8 @@ if __name__ == "__main__":
     # Start GUI server, configure and run training
     network_gui.init(args.ip, args.port)
     torch.autograd.set_detect_anomaly(args.detect_anomaly)
-    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations, args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.use_wandb)
+    training(lp.extract(args), op.extract(args), pp.extract(args), args.test_iterations, args.save_iterations,
+             args.checkpoint_iterations, args.start_checkpoint, args.debug_from, args.use_wandb)
 
     # All done
     print("\nTraining complete.")
