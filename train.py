@@ -24,9 +24,10 @@ import json
 import torch.nn.functional as F
 import math
 
+# TODO
 ft_start_iter = 20000
 inner_start_iter = 25000
-lambda_inner = 0.1
+lambda_inner = 0.2
 
 def compute_interior_consistency_loss(logits, gt_obj, num_classes, erode_ks=5, min_region=20):
     """
@@ -152,6 +153,17 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         loss_map = cls_criterion(logits.unsqueeze(0), gt_obj.unsqueeze(0)).squeeze(0)  # [H, W]
         loss_obj_base = loss_map.mean() / math.log(num_classes)
 
+        # Foreground Anti-Collapse Loss
+        prob = torch.softmax(logits, dim=0)  # [C,H,W]
+        prob_0 = prob[0]  # [H,W]
+
+        fg_mask = (gt_obj != 0)  # GT前景区域
+
+        if fg_mask.sum() > 0:
+            loss_collapse = prob_0[fg_mask].mean()
+        else:
+            loss_collapse = torch.tensor(0.0, device=logits.device)
+
         if iteration < ft_start_iter:
             loss_obj_2d = loss_obj_base
         else:
@@ -167,14 +179,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 dilated = F.max_pool2d(mask, kernel_size=5, stride=1, padding=2)
                 eroded = -F.max_pool2d(-mask, kernel_size=5, stride=1, padding=2)
                 boundary = (dilated != eroded).squeeze(0).squeeze(0)
-
+                # 边界权重 TODO
                 weight_map[boundary] = 0.3
 
             loss_obj_weight = (loss_map * weight_map).sum() / (weight_map.sum() + 1e-6)
             loss_obj_weight = loss_obj_weight / math.log(num_classes)
 
             if iteration < inner_start_iter:
-                loss_obj_2d = loss_obj_weight
+                loss_obj_2d = loss_obj_weight + loss_collapse
             else:
                 if iteration % 5 == 0:
                     loss_inner = compute_interior_consistency_loss(
@@ -187,7 +199,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 else:
                     loss_inner = torch.tensor(0.0, device=logits.device)
 
-                loss_obj_2d = loss_obj_weight + lambda_inner * loss_inner
+                loss_obj_2d = loss_obj_weight + loss_collapse + lambda_inner * loss_inner
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
@@ -215,15 +227,29 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             if iteration == opt.iterations:
                 progress_bar.close()
 
-                # Log and save
-                training_report(iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations,
-                                scene, render, (pipe, background), loss_obj_3d, use_wandb)
-                if (iteration in saving_iterations):
-                    print("\n[ITER {}] Saving Gaussians".format(iteration))
-                    scene.save(iteration)
-                    torch.save(classifier.state_dict(),
-                               os.path.join(scene.model_path, "point_cloud/iteration_{}".format(iteration),
-                                            'classifier.pth'))
+            # Log and save
+            training_report(
+                iteration,
+                Ll1,
+                loss,
+                l1_loss,
+                iter_start.elapsed_time(iter_end),
+                testing_iterations,
+                scene,
+                render,
+                (pipe, background),
+                loss_obj_3d,
+                use_wandb,
+                loss_collapse=loss_collapse,
+                loss_inner=loss_inner if iteration >= inner_start_iter else None,
+                loss_obj_2d=loss_obj_2d,
+            )
+            if (iteration in saving_iterations):
+                print("\n[ITER {}] Saving Gaussians".format(iteration))
+                scene.save(iteration)
+                torch.save(classifier.state_dict(),
+                           os.path.join(scene.model_path, "point_cloud/iteration_{}".format(iteration),
+                                        'classifier.pth'))
 
             # Densification
             if iteration < opt.densify_until_iter:
@@ -265,14 +291,21 @@ def prepare_output_and_logger(args):
 
 
 def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene: Scene, renderFunc, renderArgs,
-                    loss_obj_3d, use_wandb):
+                    loss_obj_3d, use_wandb, loss_collapse=None, loss_inner=None, loss_obj_2d=None):
     if use_wandb:
         if loss_obj_3d:
-            wandb.log({"train_loss_patches/l1_loss": Ll1.item(), "train_loss_patches/total_loss": loss.item(),
-                       "train_loss_patches/loss_obj_3d": loss_obj_3d.item(), "iter_time": elapsed, "iter": iteration})
+            log_payload = {"train_loss_patches/l1_loss": Ll1.item(), "train_loss_patches/total_loss": loss.item(),
+                           "train_loss_patches/loss_obj_3d": loss_obj_3d.item(), "iter_time": elapsed, "iter": iteration}
         else:
-            wandb.log({"train_loss_patches/l1_loss": Ll1.item(), "train_loss_patches/total_loss": loss.item(),
-                       "iter_time": elapsed, "iter": iteration})
+            log_payload = {"train_loss_patches/l1_loss": Ll1.item(), "train_loss_patches/total_loss": loss.item(),
+                           "iter_time": elapsed, "iter": iteration}
+        if loss_collapse is not None:
+            log_payload["train_loss_patches/loss_collapse"] = loss_collapse.item()
+        if loss_inner is not None:
+            log_payload["train_loss_patches/loss_inner"] = loss_inner.item()
+        if loss_obj_2d is not None:
+            log_payload["train_loss_patches/loss_obj_2d"] = loss_obj_2d.item()
+        wandb.log(log_payload)
 
     # Report test and samples of training set
     if iteration in testing_iterations:
@@ -320,8 +353,8 @@ if __name__ == "__main__":
     parser.add_argument('--port', type=int, default=6009)
     parser.add_argument('--debug_from', type=int, default=-1)
     parser.add_argument('--detect_anomaly', action='store_true', default=False)
-    parser.add_argument("--test_iterations", nargs="+", type=int, default=[1_000, 7_000, 30_000, 30_000])
-    parser.add_argument("--save_iterations", nargs="+", type=int, default=[1_000, 7_000, 30_000, 60_000])
+    parser.add_argument("--test_iterations", nargs="+", type=int, default=[7_000, 30_000, 30_000])
+    parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000, 60_000])
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default=None)

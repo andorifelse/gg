@@ -89,8 +89,18 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         results = render(view, gaussians, pipeline, background)
         rendering = results["render"]
         rendering_obj = results["render_object"]
-        
-        logits = classifier(rendering_obj)
+        logits = classifier(rendering_obj) # [C, H, W]
+
+        # 测试黑洞的原因
+        # if idx == 10:
+        #     prob = torch.softmax(logits, dim=0)  # [C,H,W]
+        #     max_prob, pred = prob.max(dim=0)  # [H,W], [H,W]
+        #     print(max_prob)
+        #     print(pred)
+        #     max_prob = max_prob.cpu().numpy()
+        #     pred = pred.cpu().numpy()
+
+        # 在类别维度 C 上找最大值的索引
         pred_obj = torch.argmax(logits,dim=0)
         pred_obj_mask = visualize_obj(pred_obj.cpu().numpy().astype(np.uint8))
         
