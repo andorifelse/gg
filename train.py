@@ -27,7 +27,7 @@ import math
 # TODO
 ft_start_iter = 20000
 inner_start_iter = 25000
-lambda_inner = 0.2
+lambda_inner = 0.5
 
 def compute_interior_consistency_loss(logits, gt_obj, num_classes, erode_ks=5, min_region=20):
     """
@@ -165,7 +165,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
             loss_collapse = torch.tensor(0.0, device=logits.device)
 
         if iteration < ft_start_iter:
-            loss_obj_2d = loss_obj_base
+            loss_obj_2d = loss_obj_base + loss_collapse
         else:
             # ---------------- boundary-weighted CE ----------------
             weight_map = torch.ones_like(loss_map)
