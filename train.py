@@ -24,12 +24,11 @@ import json
 import torch.nn.functional as F
 import math
 
-# TODO
-ft_start_iter = 20000
-inner_start_iter = 25000
-lambda_inner = 0.5
+warm_up_iter = 5000
+inner_start_iter = 20000
+lambda_inner = 1.5
 
-def compute_interior_consistency_loss(logits, gt_obj, num_classes, erode_ks=5, min_region=20):
+def compute_interior_consistency_loss(logits, gt_obj, num_classes, erode_ks=3, min_region=20):
     """
     logits: [C, H, W]
     gt_obj: [H, W]  (long)
@@ -164,10 +163,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         else:
             loss_collapse = torch.tensor(0.0, device=logits.device)
 
-        if iteration < ft_start_iter:
+        loss_obj_weight = None
+        loss_inner = None
+        self_weight_mean = None
+
+        if iteration < warm_up_iter:
             loss_obj_2d = loss_obj_base + loss_collapse
         else:
-            # ---------------- boundary-weighted CE ----------------
+            # Boundary prior: downweight ambiguous edge pixels.
             weight_map = torch.ones_like(loss_map)
 
             present_classes = torch.unique(gt_obj)
@@ -179,8 +182,14 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 dilated = F.max_pool2d(mask, kernel_size=5, stride=1, padding=2)
                 eroded = -F.max_pool2d(-mask, kernel_size=5, stride=1, padding=2)
                 boundary = (dilated != eroded).squeeze(0).squeeze(0)
-                # 边界权重 TODO
-                weight_map[boundary] = 0.3
+                weight_map[boundary] = 0.5
+
+            # Self-adaptive weighting: pixels with higher GT-class confidence
+            # contribute more once the classifier is reasonably trained.
+            gt_prob = prob.gather(0, gt_obj.unsqueeze(0)).squeeze(0)
+            self_weight = (0.5 + gt_prob.detach()).clamp(min=0.5, max=1.5)
+            self_weight_mean = self_weight.mean()
+            weight_map = weight_map * self_weight
 
             loss_obj_weight = (loss_map * weight_map).sum() / (weight_map.sum() + 1e-6)
             loss_obj_weight = loss_obj_weight / math.log(num_classes)
@@ -193,7 +202,7 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                         logits=logits,
                         gt_obj=gt_obj,
                         num_classes=num_classes,
-                        erode_ks=5,
+                        erode_ks=3,
                         min_region=20
                     )
                 else:
@@ -240,7 +249,10 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
                 (pipe, background),
                 loss_obj_3d,
                 use_wandb,
+                loss_obj_base=loss_obj_base,
+                loss_obj_weight=loss_obj_weight,
                 loss_collapse=loss_collapse,
+                self_weight_mean=self_weight_mean,
                 loss_inner=loss_inner if iteration >= inner_start_iter else None,
                 loss_obj_2d=loss_obj_2d,
             )
@@ -291,7 +303,8 @@ def prepare_output_and_logger(args):
 
 
 def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, scene: Scene, renderFunc, renderArgs,
-                    loss_obj_3d, use_wandb, loss_collapse=None, loss_inner=None, loss_obj_2d=None):
+                    loss_obj_3d, use_wandb, loss_obj_base=None, loss_obj_weight=None,
+                    loss_collapse=None, self_weight_mean=None, loss_inner=None, loss_obj_2d=None):
     if use_wandb:
         if loss_obj_3d:
             log_payload = {"train_loss_patches/l1_loss": Ll1.item(), "train_loss_patches/total_loss": loss.item(),
@@ -299,13 +312,19 @@ def training_report(iteration, Ll1, loss, l1_loss, elapsed, testing_iterations, 
         else:
             log_payload = {"train_loss_patches/l1_loss": Ll1.item(), "train_loss_patches/total_loss": loss.item(),
                            "iter_time": elapsed, "iter": iteration}
+        if loss_obj_base is not None:
+            log_payload["train_loss_patches/loss_obj_base"] = loss_obj_base.item()
+        if loss_obj_weight is not None:
+            log_payload["train_loss_patches/loss_obj_weight"] = loss_obj_weight.item()
         if loss_collapse is not None:
             log_payload["train_loss_patches/loss_collapse"] = loss_collapse.item()
+        if self_weight_mean is not None:
+            log_payload["train_loss_patches/self_weight_mean"] = self_weight_mean.item()
         if loss_inner is not None:
             log_payload["train_loss_patches/loss_inner"] = loss_inner.item()
         if loss_obj_2d is not None:
             log_payload["train_loss_patches/loss_obj_2d"] = loss_obj_2d.item()
-        wandb.log(log_payload)
+        wandb.log(log_payload, step=iteration)
 
     # Report test and samples of training set
     if iteration in testing_iterations:
