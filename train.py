@@ -24,16 +24,10 @@ import json
 import torch.nn.functional as F
 import math
 
-# 0~2999：base
-# 3000~19999：base + collapse
-# 20000~24999：boundary-weighted CE + self-weight + collapse
-# 25000+：再叠加 interior consistency，每 5 轮算一次
-
-warm_up_iter = 3000
 ft_start_iter = 20000
 inner_start_iter = 25000
 lambda_inner = 0.2
-lambda_collapse = 1.2
+lambda_collapse = 0.6
 
 # 一致性检测
 def compute_interior_consistency_loss(logits, gt_obj, num_classes, erode_ks=5, min_region=20):
@@ -174,51 +168,48 @@ def training(dataset, opt, pipe, testing_iterations, saving_iterations, checkpoi
         loss_inner = None
         self_weight_mean = None
 
-        if iteration < warm_up_iter:
+        if iteration < ft_start_iter:
             loss_obj_2d = loss_obj_base
         else:
-            if iteration < ft_start_iter:
-                loss_obj_2d = loss_obj_base + lambda_collapse * loss_collapse
+            # Boundary prior: downweight ambiguous edge pixels.
+            weight_map = torch.ones_like(loss_map)
+
+            present_classes = torch.unique(gt_obj)
+            for cls_id in present_classes.tolist():
+                mask = (gt_obj == cls_id).float().unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
+                if mask.sum() == 0:
+                    continue
+
+                dilated = F.max_pool2d(mask, kernel_size=5, stride=1, padding=2)
+                eroded = -F.max_pool2d(-mask, kernel_size=5, stride=1, padding=2)
+                boundary = (dilated != eroded).squeeze(0).squeeze(0)
+                weight_map[boundary] = 0.3
+
+            # Self-adaptive weighting: pixels with higher GT-class confidence
+            # contribute more once the classifier is reasonably trained.
+            gt_prob = prob.gather(0, gt_obj.unsqueeze(0)).squeeze(0)
+            self_weight = (0.5 + gt_prob.detach()).clamp(min=0.5, max=1.5)
+            self_weight_mean = self_weight.mean()
+            weight_map = weight_map * self_weight
+
+            loss_obj_weight = (loss_map * weight_map).sum() / (weight_map.sum() + 1e-6)
+            loss_obj_weight = loss_obj_weight / math.log(num_classes)
+
+            if iteration < inner_start_iter:
+                loss_obj_2d = loss_obj_weight + lambda_collapse * loss_collapse
             else:
-                # Boundary prior: downweight ambiguous edge pixels.
-                weight_map = torch.ones_like(loss_map)
-
-                present_classes = torch.unique(gt_obj)
-                for cls_id in present_classes.tolist():
-                    mask = (gt_obj == cls_id).float().unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
-                    if mask.sum() == 0:
-                        continue
-
-                    dilated = F.max_pool2d(mask, kernel_size=5, stride=1, padding=2)
-                    eroded = -F.max_pool2d(-mask, kernel_size=5, stride=1, padding=2)
-                    boundary = (dilated != eroded).squeeze(0).squeeze(0)
-                    weight_map[boundary] = 0.3
-
-                # Self-adaptive weighting: pixels with higher GT-class confidence
-                # contribute more once the classifier is reasonably trained.
-                # gt_prob = prob.gather(0, gt_obj.unsqueeze(0)).squeeze(0)
-                # self_weight = (0.5 + gt_prob.detach()).clamp(min=0.5, max=1.5)
-                # self_weight_mean = self_weight.mean()
-                # weight_map = weight_map * self_weight
-
-                loss_obj_weight = (loss_map * weight_map).sum() / (weight_map.sum() + 1e-6)
-                loss_obj_weight = loss_obj_weight / math.log(num_classes)
-
-                if iteration < inner_start_iter:
-                    loss_obj_2d = loss_obj_weight + lambda_collapse * loss_collapse
+                if iteration % 5 == 0:
+                    loss_inner = compute_interior_consistency_loss(
+                        logits=logits,
+                        gt_obj=gt_obj,
+                        num_classes=num_classes,
+                        erode_ks=5,
+                        min_region=20
+                    )
                 else:
-                    if iteration % 5 == 0:
-                        loss_inner = compute_interior_consistency_loss(
-                            logits=logits,
-                            gt_obj=gt_obj,
-                            num_classes=num_classes,
-                            erode_ks=5,
-                            min_region=20
-                        )
-                    else:
-                        loss_inner = torch.tensor(0.0, device=logits.device)
+                    loss_inner = torch.tensor(0.0, device=logits.device)
 
-                    loss_obj_2d = loss_obj_weight + lambda_collapse * loss_collapse + lambda_inner * loss_inner
+                loss_obj_2d = loss_obj_weight + lambda_collapse * loss_collapse + lambda_inner * loss_inner
 
         # Loss
         gt_image = viewpoint_cam.original_image.cuda()
