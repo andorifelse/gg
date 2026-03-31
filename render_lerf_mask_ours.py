@@ -21,10 +21,47 @@ import numpy as np
 from PIL import Image
 import cv2
 
-from ext.grounded_sam import grouned_sam_output, load_model_hf, select_obj_ioa
+from ext.grounded_sam import grouned_sam_output, load_model_hf
 from segment_anything import sam_model_registry, SamPredictor
 
 from render import feature_to_rgb, visualize_obj
+
+
+def select_obj_soft_score(logits, text_mask, score_thresh=0.05):
+    prob = torch.softmax(logits, dim=0)
+    text_mask = text_mask.bool().to(prob.device)
+
+    if text_mask.sum() == 0:
+        return torch.empty(0, dtype=torch.long, device=prob.device)
+
+    inside_score = prob[:, text_mask].mean(dim=1)
+    if (~text_mask).sum() > 0:
+        outside_score = prob[:, ~text_mask].mean(dim=1)
+    else:
+        outside_score = torch.zeros_like(inside_score)
+
+    class_scores = inside_score - outside_score
+    selected_obj_ids = torch.nonzero(class_scores > score_thresh, as_tuple=False).squeeze(1)
+
+    # Explicitly drop the background / invalid class.
+    selected_obj_ids = selected_obj_ids[selected_obj_ids != 0]
+    return selected_obj_ids
+
+
+def postprocess_mask(mask):
+    if mask.max() == 0:
+        return mask
+
+    kernel = np.ones((3, 3), dtype=np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if num_labels <= 1:
+        return mask
+
+    largest_label = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+    return np.where(labels == largest_label, 255, 0).astype(np.uint8)
 
 
 def render_set(model_path, name, iteration, views, gaussians, pipeline, background, classifier, groundingdino_model, sam_predictor, TEXT_PROMPT, threshold=0.2):
@@ -42,12 +79,11 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     rendering0 = results0["render"]
     rendering_obj0 = results0["render_object"]
     logits = classifier(rendering_obj0)
-    pred_obj = torch.argmax(logits,dim=0) # 1*H*W的2D图
 
     image = (rendering0.permute(1,2,0) * 255).cpu().numpy().astype('uint8')
     text_mask, annotated_frame_with_mask = grouned_sam_output(groundingdino_model, sam_predictor, TEXT_PROMPT, image)
     Image.fromarray(annotated_frame_with_mask).save(os.path.join(render_path[:-8],'grounded-sam---'+TEXT_PROMPT+'.png'))
-    selected_obj_ids = select_obj_ioa(pred_obj, text_mask)
+    selected_obj_ids = select_obj_soft_score(logits, text_mask)
 
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
         pred_obj_img_path = os.path.join(pred_obj_path,str(idx))
@@ -64,6 +100,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
             pred_obj_mask = prob[selected_obj_ids, :, :] > threshold
             pred_obj_mask = pred_obj_mask.any(dim=0)
             pred_obj_mask = (pred_obj_mask.squeeze().cpu().numpy() * 255).astype(np.uint8)
+            pred_obj_mask = postprocess_mask(pred_obj_mask)
         else:
             pred_obj_mask = torch.zeros_like(view.objects).cpu().numpy()
 

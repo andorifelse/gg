@@ -5,10 +5,15 @@ import cv2
 import sys
 
 dataset_name = sys.argv[1]
-
+# autodl command
 gt_folder_path = os.path.join('data/lerf_mask',dataset_name,'test_mask')
 # You can change pred_folder_path to your output
-pred_folder_path = os.path.join('/root/autodl-tmp/result/lerf_mask',dataset_name,'test_mask')
+pred_folder_path = os.path.join('/root/autodl-tmp/result/lerf_mask_ours',dataset_name,'test_mask')
+
+# # local command
+# gt_folder_path = os.path.join('/media/wzc/KIOXIA/Gaussian-Grouping/data/lerf_mask',dataset_name,'test_mask')
+# # You can change pred_folder_path to your output
+# pred_folder_path = os.path.join('/media/wzc/KIOXIA/lerf_mask_ours',dataset_name,'test_mask')
 
 # General util function to get the boundary of a binary mask.
 # https://gist.github.com/bowenc0221/71f7a02afee92646ca05efeeb14d687d
@@ -72,8 +77,30 @@ def calculate_iou(mask1, mask2):
     iou = np.sum(intersection) / np.sum(union)
     return iou
 
+def calculate_accuracy(mask1, mask2):
+    """Calculate foreground class accuracy: TP / (TP + FN)."""
+    mask1_bool = mask1 > 128
+    mask2_bool = mask2 > 128
+    gt_positive = np.sum(mask1_bool)
+    if gt_positive == 0:
+        return 0.0
+    true_positive = np.sum(np.logical_and(mask1_bool, mask2_bool))
+    return true_positive / gt_positive
+
+def calculate_dice(mask1, mask2):
+    """Calculate Dice score between two boolean masks."""
+    mask1_bool = mask1 > 128
+    mask2_bool = mask2 > 128
+    intersection = np.sum(np.logical_and(mask1_bool, mask2_bool))
+    total = np.sum(mask1_bool) + np.sum(mask2_bool)
+    if total == 0:
+        return 1.0
+    return 2 * intersection / total
+
 iou_scores = {}  # Store IoU scores for each class
 biou_scores = {}
+acc_scores = {}
+dice_scores = {}
 class_counts = {}  # Count the number of times each class appears
 
 # Iterate over each image and category in the GT dataset
@@ -99,23 +126,37 @@ for image_name in os.listdir(gt_folder_path):
 
                 iou = calculate_iou(gt_mask, pred_mask)
                 biou = boundary_iou(gt_mask, pred_mask)
-                print("IoU: ",iou," BIoU:   ",biou)
+                acc = calculate_accuracy(gt_mask, pred_mask)
+                dice = calculate_dice(gt_mask, pred_mask)
+                print("IoU: ",iou," BIoU:   ",biou," Acc:   ",acc," Dice:   ",dice)
                 if cat_id not in iou_scores:
                     iou_scores[cat_id] = []
                     biou_scores[cat_id] = []
+                    acc_scores[cat_id] = []
+                    dice_scores[cat_id] = []
                 iou_scores[cat_id].append(iou)
                 biou_scores[cat_id].append(biou)
+                acc_scores[cat_id].append(acc)
+                dice_scores[cat_id].append(dice)
                 class_counts[cat_id] = class_counts.get(cat_id, 0) + 1
 
 # Calculate mean IoU for each class
 mean_iou_per_class = {cat_id: np.mean(iou_scores[cat_id]) for cat_id in iou_scores}
 mean_biou_per_class = {cat_id: np.mean(biou_scores[cat_id]) for cat_id in biou_scores}
+mean_acc_per_class = {cat_id: np.mean(acc_scores[cat_id]) for cat_id in acc_scores}
+mean_dice_per_class = {cat_id: np.mean(dice_scores[cat_id]) for cat_id in dice_scores}
 
 # Calculate overall mean IoU
 overall_mean_iou = np.mean(list(mean_iou_per_class.values()))
 overall_mean_biou = np.mean(list(mean_biou_per_class.values()))
+overall_mean_acc = np.mean(list(mean_acc_per_class.values()))
+overall_mean_dice = np.mean(list(mean_dice_per_class.values()))
 
 print("Mean IoU per class:", mean_iou_per_class)
 print("Mean Boundary IoU per class:", mean_biou_per_class)
+print("Mean Accuracy per class:", mean_acc_per_class)
+print("Mean Dice per class:", mean_dice_per_class)
 print("Overall Mean IoU:", overall_mean_iou)
 print("Overall Boundary Mean IoU:", overall_mean_biou)
+print("Overall Mean Accuracy:", overall_mean_acc)
+print("Overall Mean Dice:", overall_mean_dice)
