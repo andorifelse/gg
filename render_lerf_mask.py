@@ -26,6 +26,18 @@ from segment_anything import sam_model_registry, SamPredictor
 
 from render import feature_to_rgb, visualize_obj
 
+#
+# 当前视角 view
+#   -> render()
+#      -> rendering      (RGB)
+#      -> rendering_obj  (object feature map)
+#   -> classifier(rendering_obj)
+#      -> logits
+#      -> softmax
+#      -> 取 selected_obj_ids 对应通道
+#      -> 阈值化
+#      -> 合并成 pred_obj_mask
+#   -> 保存 mask / RGB / GT / feature 可视化
 
 def render_set(model_path, name, iteration, views, gaussians, pipeline, background, classifier, groundingdino_model, sam_predictor, TEXT_PROMPT, threshold=0.2):
     render_path = os.path.join(model_path, name, "ours_{}_text".format(iteration), "renders")
